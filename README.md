@@ -33,7 +33,7 @@
 | HDMI 输出（Panfrost GPU） | ✅ DTB 用正点原厂 `panfrost-hdmi` |
 | 系统盘容量 | ✅ **56.39 GB**（整块 eMMC 已并入根分区） |
 | device-mapper / LVM / mdadm | ✅ 内核已启用 |
-| **FnNAS 存储空间（创建卷）** | ❌ **仍需外接 USB/NVMe 硬盘**，详见第五节 |
+| **FnNAS 存储空间（创建卷）** | ⚠️ 外接 NVMe **已被正确识别**（`nvme0n1`），但**格式化步骤失败**，详见第六节 |
 | **FnNAS 在线更新** | ❌ 架构不匹配，**切勿点击「立即更新」** |
 | 串口 console | ⚠️ 固件侧已配置正确，但需自行确认接线 |
 
@@ -298,25 +298,54 @@ int get_sys_disk_free_space_partno() {
 
 ## 六、没有解决的问题（重要）
 
-### 1. FnNAS 存储空间仍必须外接硬盘 🔴
+### 1. FnNAS 存储空间：外接盘已被识别，但格式化失败 🔴
 
-这是投入最大、仍未攻克的问题。
+这是投入最大的问题，**2026-10-17 晚有了决定性进展**。
 
-**现象**：FnNAS「存储空间管理 → 创建存储空间」始终提示「当前暂无可用于创建存储空间的硬盘」。
+#### 已经验证成立的部分 ✅
 
-**已经查明的**：
+插上一块 **KIOXIA EXCERIA G2 931.51GB NVMe SSD** 后，FnNAS **正确识别并列出**了它：
 
-- `get_sys_disk_free_space_partno()` 期望的「系统盘剩余空间」分区号 = 根分区号 + 1 = **7**
-- 它通过 `/sys/block/mmcblk0/mmcblk0p7/{start,size}` 读取容量，`access()` 失败才降级去读 p6
-- strace 实测：**p7 被正确找到，size 成功读到**（`/sys/block/mmcblk0/mmcblk0p7/size` 打开成功、`statx("/dev/mmcblk0p7")` 返回 0）
-- `stor_set_disk_info()` 被反复调用，说明 FnNAS 确实在组装磁盘信息
-- **但在纯内存判断处被丢弃** —— gdb 下在 `list_block_device()` 的判定分支上设断点，一次都没命中
+```
+931.51 GB   未使用
+硬盘类型    SSD          型号  KIOXIA-EXCERIA G2 SSD
+接口协议    NVMe         序列号 52VFC00TFM15
+分区        nvme0n1p1    健康状态 正常 / 41°C
+```
 
-**结论**：`is_dev_disk()` 的白名单只有 `sd`/`nvme`/`hd`/`vd`/`mmc` 五个前缀。eMMC 上分出来的任何空间（含 dm-linear、loop 伪装）都不被当作独立硬盘。
+**这直接验证了第四节的逆向结论** —— `is_dev_disk()` 的五前缀白名单是对的，带 `device/` 的真实块设备确实会被 FnNAS 当作独立硬盘。对比之下，eMMC 上的分区（无论怎么摆）都进不了这个列表。
 
-**唯一可靠的解**：插一块 USB 移动硬盘 / U 盘 / USB-SATA 盒子里的 SSD。带 `/sys/block/<dev>/device/` 的真实块设备是 FnNAS 唯一认的类型，插上后 FnNAS 会识别成 `/dev/sda`，四种存储模式、应用中心、文件共享全部可用。
+#### 仍未解决的部分 ❌
 
-> 顺带一提：DTX 的 dm-linear 方案之所以失败，根本原因是 **dm 设备和 loop 设备都没有 `device/` 目录**，而 `mmcblk0`/`mmcblk0boot0` 有 —— 这条对比数据就是判定依据。
+**FnNAS 在最后的「确认格式化」步骤反复失败**，存储空间建不出来。
+
+从 `storage.hdl` 的字符串看，它建卷时固定执行：
+
+```bash
+parted --script /dev/nvme0n1 mklabel gpt
+parted --script /dev/nvme0n1 mkpart primary 1MiB 100% set 1 raid on   # 或 msftdata
+mke2fs -O project,quota,bigalloc -F -m bigalloc /dev/nvme0n1p1
+```
+
+**两个最可能的原因**（尚未拿到实际 stderr，无法确定）：
+
+1. **`-O project,quota,bigalloc` 这组选项** —— `bigalloc` 会把块大小设得很大（默认 16K 甚至更大），若与分区对齐、`mke2fs` 版本不匹配就会失败；project quota 还需要内核侧 `CONFIG_QUOTA` / quota 相关支持
+2. **NVMe 链路稳定性** —— 41°C 说明盘在发热，若控制器超时或掉线，格式化中途失败也符合
+
+#### 需要做的排查
+
+```bash
+# 拿到 FnNAS 实际调用的 parted / mkfs stderr
+sudo grep -rE 'parted|mke2fs|mkfs|Format|format' /usr/trim/logs/*.log | tail -40
+
+# 手动复现格式化，看真实报错（⚠️ 会清空整块盘）
+sudo parted -s /dev/nvme0n1 mklabel gpt
+sudo parted -s /dev/nvme0n1 mkpart primary 1MiB 100%
+sudo mkfs.ext4 -O project,quota,bigalloc -F -m bigalloc /dev/nvme0n1p1
+```
+
+> 如果 `-O project,quota,bigalloc` 报错，去掉这三个选项试试 `mke2fs -t ext4 -F /dev/nvme0n1p1`。
+> 如果 parted 报错，先确认盘没被挂载：`lsblk -no MOUNTPOINT /dev/nvme0n1`。
 
 ### 2. 在线更新不可用 🔴
 
@@ -343,10 +372,13 @@ linux-image-6.18.18.c1145-trim   34.26M
 
 板载 UART 是 **UART2**：`GPIO0_D0 = RX`、`GPIO0_D1 = TX`（pinctrl `uart2m0_xfer`），CH340 在板上以 3.3V TTL 连出。
 
-### 4. 硬件扩展限制 ⚠️
+### 4. 硬件扩展 ⚠️
 
-- **没有 PCIe**：`/sys/bus/pci/devices/` 为空，`pcie-rkep` 未加载 → **M.2 NVMe 不可用**
-- **USB 3.0 主机口 × 2**（5Gbps xHCI + DWC3）→ 这是唯一可行的外接存储途径
+- **M.2 NVMe 可用 ✅** —— 实测插入 NVMe SSD 后被识别为 `nvme0n1`（931.51GB，SMART 健康），内核 `pcie-rkep` + `nvme` 驱动正常工作
+
+  > ⚠️ 早期文档曾写「本板没有 PCIe、M.2 不可用」，**这是错的**。当时探测 `/sys/bus/pci/devices/` 为空，是因为**没有任何 PCIe 设备接入**，控制器驱动自然不会加载。插盘后即恢复。
+
+- **USB 3.0 主机口 × 2**（5Gbps xHCI + DWC3）—— 备选的外接存储途径
 - 运行内存仅 4GB
 
 ### 5. Docker 默认仍写系统盘 ⚠️
@@ -486,39 +518,32 @@ lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT /dev/mmcblk0   # 应只剩 p1~p6
 
 ## 十三、镜像下载
 
-GitHub Release 单个附件上限 **2 GB**，而本镜像是 3.5 GB，因此拆成两个分卷：
+### 当前状态：Release 暂未附镜像
 
-### 下载
+本镜像 3.5 GB。GitHub Release 单附件上限是 **2 GB**，需要拆成两卷上传；
+但实测当前网络上行仅约 **0.15 MB/s**，传完需要近 10 小时，因此**暂未附带二进制**。
 
-从仓库的 **Releases** 页面下载这两个文件：
+如果你需要现成的镜像，可以：
 
-```
-fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img.part0   1,847,353,637 字节
-fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img.part1   1,847,353,637 字节
-```
+1. **自行构建**（推荐，见下）
+2. 在 **Releases** 页面提 Issue 索要，作者可按需上传
+3. 自行传（若有较快网络）：
+   ```bash
+   # 先切分
+   split -b 1847353637 -d -a 1 fnnas.img fnnas.img.part
+   # 再上传
+   gh release upload v1.0.0701-2026-10-17 fnnas.img.part0 fnnas.img.part1
+   ```
 
-### 合并（Windows）
+### 镜像信息（供自行构建后比对）
 
-```powershell
-# PowerShell
-Get-Content part0, part1 -AsByteStream -ReadCount 0 | Set-Content fnnas.img -AsByteStream
-# 或用 CMD
-copy /b part0+part1 fnnas.img
-```
-
-### 合并（Linux / macOS）
-
-```bash
-cat fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img.part* > fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img
-```
-
-### 校验
-
-```bash
-md5sum    fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img
-# 期望: 105bbbe34c62288413f28c2f00c04bbd
-sha256sum fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img
-```
+| 项 | 值 |
+|---|---|
+| 文件名 | `fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img` |
+| 大小 | 3,694,707,274 字节 |
+| MD5 | `105bbbe34c62288413f28c2f00c04bbd` |
+| 格式 | RKAF（头 4 字节 `524b4657` = "RKFW"） |
+| 构建时间 | 2026-10-17 19:12 |
 
 ### 自行构建
 
@@ -528,7 +553,7 @@ sha256sum fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img
 bash build/00-build-all.sh
 ```
 
-详见 [构建说明](#七环境与工具链)。
+详见第七节与第九节。
 
 > ⚠️ 构建需要正点原子官方 SDK 和一份原厂 `hdmi_ubuntu26.04.1_update.img`（含 FnNAS ARM 用户空间）。
 > 该原厂镜像受正点原子版权保护，**不随本仓库分发**，请自行从正点原子渠道获取。

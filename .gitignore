@@ -25,3 +25,4 @@ Thumbs.db
 # Release 资产（3.5GB，超过 GitHub 100MB 文件上限）
 release/
 .commitmsg.txt
+.releasenotes.md
