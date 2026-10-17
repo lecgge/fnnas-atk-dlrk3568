@@ -1,0 +1,27 @@
+# 忽略大文件与本地产物
+*.img
+*.img.gz
+*.part[0-9]
+*.tar
+*.bin
+
+# 构建产物
+out/
+build/output/
+*.o
+*.ko
+*.dtb
+
+# 参考镜像（正点原厂，第三方，不入库）
+hdmi_ubuntu26.04.1_update.img
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+
+# Release 资产（3.5GB，超过 GitHub 100MB 文件上限）
+release/
+.commitmsg.txt
