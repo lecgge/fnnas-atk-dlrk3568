@@ -1,6 +1,6 @@
 #!/bin/bash
 set +e
-IMG=/mnt/c/Users/Xuleyu/Documents/work/fn-atk/out/fnnas_ATK-DLRK3568_FnNAS-v4_2026.10.18.img
+IMG=/mnt/c/Users/Xuleyu/Documents/work/fn-atk/out/fnnas_ATK-DLRK3568_FnNAS-v5_2026.10.18.img
 B=/root/atk-work/atk-build
 BOOT_OFF=$((0x4F9226))
 ROOT_OFF=$((0x5B8C226))
@@ -90,6 +90,10 @@ grep -cE 'RemainAfterExit' $W/mnt/etc/systemd/system/fnnas-vol-mount.service | s
 grep -nE 'try-restart trim_main' $W/mnt/usr/local/sbin/fnnas-vol-mount.sh | sed 's/^/    /'
 echo "--- docker 包装器 ---"
 grep -c 'data-root' $W/mnt/usr/local/sbin/fnnas-dockerd.sh | sed 's/^/    data-root 处理行数: /'
+echo "--- docker drop-in（绝不能含 Wants/After=fnnas-vol-mount）---"
+grep -cE 'Wants=fnnas-vol-mount|After=fnnas-vol-mount' $W/mnt/etc/systemd/system/docker.service.d/10-fnnas-datadir.conf | sed 's/^/    反向依赖行数(必须为0): /'
+echo "--- 自愈脚本含 --no-block ---"
+grep -c 'no-block' $W/mnt/usr/local/sbin/fnnas-vol-mount.sh | sed 's/^/    --no-block 出现次数: /'
 
 echo
 echo "════ 5. ext4 特性 ════"

@@ -272,7 +272,7 @@ int get_sys_disk_free_space_partno() {
 }
 ```
 
-### 9. 我自己犯的九个错（全部有代价）
+### 9. 我自己犯的十三个错（全部有代价）
 
 这一节记录的是**我自己在这次适配里犯的低级错误**，不是 FnNAS/正点原厂的问题。它们的共同点是：症状出现在很远的地方，根因在很近的地方。
 
@@ -361,6 +361,59 @@ fi
 > if [ "$MOUNTED" = "1" ]; then systemctl try-restart trim_main.service; fi
 > ```
 > 修好后：快路径耗时 0.435 秒，trim_main PID 90 秒内不变，Web 连续 6 次 200。
+
+**⑩ 把修复代码放在快路径 `exit` 之后，导致它永远轮不到自己执行**
+
+```bash
+if [ "$WORK" = "0" ]; then echo "无需操作"; exit 0; fi    # ← 这里就退出了
+...
+# Docker 数据目录同步（写在后面）——永远跑不到
+```
+
+现象是「脚本日志显示一切正常，但 Docker 起不来」，而且手工单独跑也无效（因为条件还是提前退出了）。**任何周期性自愈逻辑里，只有「绝对不碰别人的状态」的检查才能放在快路径之后；配置同步类动作必须放在快路径之前。**
+
+**⑪ `printf '%x' 0x252` 输出的是 `252` 不是 `fc`**
+
+自查快路径时一度以为节点比对逻辑坏了：
+
+```bash
+$ printf '%x' 0x252
+252          # 因为 0x252 = 594，而 594 的十六进制就是 252
+$ stat -c '%t:%T' /dev/dm-0
+fc:0         # stat 输出的是十六进制
+```
+
+一边十进制、一边十六进制，永远比不相等 → 快路径永远判「有变化」→ 每轮都重启 `trim_main`。
+
+> **硬性约定**：同一个量的两种表示形式不要混着比。要么两边都 `stat -c '%t:%T'`，要么两边都从 `/sys/block/*/dev` 读。
+
+**⑫ 刷完机 Docker 起不来：不是 Docker 的问题，是 `dockermgr.conf` 的 `data-root` 是 0**
+
+```
+[error] dockermgr: No data root, stop docker service
+```
+
+`dockermgr` 发现 `data-root=0` 就直接不启动 dockerd，所以我们在 `docker.service` 上的 `ExecStart` 包装器**根本没机会执行**。必须在自愈脚本里显式把 `data-root` 写成 `<挂载点>/docker` 再 `systemctl start docker`。
+
+**⑬ systemd 依赖环 + 同步 `systemctl start`：脚本把自己等死了**
+
+修好 ⑫ 之后 docker 还是起不来。根因是我在 `docker.service.d` 里写了：
+
+```ini
+[Unit]
+Wants=fnnas-vol-mount.service
+After=fnnas-vol-mount.service
+```
+
+而 `fnnas-vol-mount.service` 内部正要 `systemctl start docker.service`（**同步**调用）。
+
+systemd 看到 docker 依赖自己正在运行的服务，就把 docker 的启动作业**排到「该服务结束之后」**；同步的 `systemctl start` 会一直等这个作业完成，于是**脚本在等自己结束** —— 死锁，直到 `TimeoutStartSec=180` 把它杀掉。日志里的特征是：只看到脚本打印了「拉起 docker」，journal 里**完全没有** `Starting docker.service`。
+
+> **硬性约定**：
+> - 让 A 启 B，就**绝不能**在 B 上写 `Wants/After = A`
+> - 服务内部调 `systemctl start` 一律加 **`--no-block`**
+
+修好后实测：自愈把 `data-root` 从 `0` 改到 `/vol1/docker`、拉起 docker、`hello-world` 通过；快路径 0.663 秒，docker 与 trim 的 PID 均不变。
 
 ---
 
@@ -504,7 +557,7 @@ mount_info_t* find_vol_mount_info(const char* uuid, mount_info_t* list, int n) {
 
 > 这段逻辑对 **ZFS 存储空间是成立的** —— ZFS 挂载后 `/etc/mtab` 的设备字段就是池名本身（`tank /vol1 zfs ...`），和 `mount.uuid` 完全相等。**LVM/RAID 路径则永远匹配不上。**
 
-**解法**：在根目录建一个名为 `<uuid>` 的块设备节点（与 LV 同 `major:minor`），`statx(uuid)` 就能成功，`find_vol_mount_info` 走 rdev 匹配，`mountpoint` 正确返回。
+**解法**：在根目录建一个名为 `<uuid>` 的块设备节点（与 LV 同 `major:minor`）：
 
 ```bash
 REAL=$(readlink -f /dev/mapper/$UUID)          # → /dev/dm-0
@@ -512,22 +565,20 @@ MAJMIN=$(cat /sys/block/dm-0/dev)             # → 252:0（十进制）
 mknod "/$UUID" b "${MAJMIN%%:*}" "${MAJMIN##*:}"
 ```
 
-这个节点由 `fnnas-vol-mount.sh` 自动维护（**必须在 `try-restart trim_main` 之前建好**，否则 trim 读到的是旧缓存），并在存储卷被删除后自动清理。
+加了这个节点、让 trim_main 重新读一遍之后，Web 上的存储空间从「未挂载」变成了**「正常」，容量 929.37 GB 全部可见，文件系统 Btrfs**。这个节点由 `fnnas-vol-mount.sh` 自动维护（**必须在 `try-restart trim_main` 之前建好**，否则 trim 读到的是旧缓存），并在存储卷被删除后自动清理。
 
-验证方式不是靠猜 —— 我用 Python 精确复刻了 `get_rdev()` + `find_vol_mount_info()` 的语义直接跑：
-
-```
-建节点前：
-  get_rdev('trim_9096701c_...') = None
-  ✗ Path B: strcmp 没有匹配项（mtab 里是 '/dev/root'，uuid 是 'trim_9096701c_...'）
-  => get_vol_mount_point() 返回 None
-  => 前端判定：未挂载(unmounted)
-
-建节点后：
-  get_rdev('trim_9096701c_...') = (252, 0)
-  ✔ Path A 命中 rdev=(252, 0) -> /vol1
-  => 前端判定：已挂载
-```
+> ⚠️ **关于「它到底影响了哪条判定路径」，我一开始的推断是错的，这里如实说明。**
+>
+> 我当时的推理是：`find_vol_mount_info()` 里 `get_rdev(uuid)` 会做 `statx(AT_FDCWD, uuid)`，裸 uuid 必然失败 → 退化到 `strcmp("/dev/mapper/xxx", "xxx")` → 永远不匹配；建了节点后 `statx` 成功 → 走 rdev 匹配 → `mountpoint` 正确。
+>
+> 但上探针实测**证伪了前半段**：整个会话期间 FnNAS 对裸 uuid 的 `stat`/`statx`/`access` **命中数为 0**，`find_vol_mount_info` 也只被 `list_block_device()` 调用（那是「哪些磁盘已被占用」的判断，跟存储列表的 `mountpoint` 不是一回事）。探针只看到 `[statx] /dev/dm-0` 后面跟着大量 `[realpath] /vol1 -> /vol1`——**挂载缓存本身是正常的**。
+>
+> 所以真实机制还没完全追清。能确定的是三件事：
+> 1. 卷没挂 → 一定显示未挂载（已验证）
+> 2. 卷挂上 + 根目录有 `<uuid>` 块设备节点 → 显示正常（已验证）
+> 3. 仅卷挂上、不建节点时的行为，前后两次观测不一致（14:21 正常、18:20 未挂载），变量不止一个
+>
+> 结论层面不影响使用：**镜像里的脚本会同时保证「卷已挂」和「别名节点已建」，两个条件都满足时实测稳定显示正常。** 但如果日后还想彻底理解 FnNAS 的判定，需要拿 `/jsonrpc` 的真实响应继续追。
 
 （顺带确认了 `mountpoint[4]` 必须是 `'1'`~`'9'`：这解释了为什么系统卷是 `/vol00` 而用户卷从 `/vol1` 起算。）
 
@@ -694,7 +745,7 @@ e2fsck -f -D
 
 1. **关闭并重新打开 RKDevTool**（必须，否则会用缓存里的旧镜像）
 2. **拔掉 TF/SD 卡**（SPL 优先枚举 MMC2，插着会抢启动顺序）
-3. 「升级固件」页 → 选择 `fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img` → 升级
+3. 「升级固件」页 → 选择 `fnnas_ATK-DLRK3568_FnNAS-v5_2026.10.18.img` → 升级
 4. **断电重新上电**（不能只看 RKDevTool 提示）
 5. 网线插 **`end1`**（不是 `end0`）
 6. 浏览器访问 `http://<板子IP>:5666`
@@ -721,9 +772,12 @@ Web → 存储空间 → 创建存储空间 → 选 NVMe → Basic / RAID1 → �
 ```bash
 systemctl is-active fnnas-vol-mount.timer       # active
 tail -20 /var/log/fnnas-vol-mount.log          # 应看到 "挂载成功 -> /vol1 (btrfs)"
+                                              # 以及 "设备别名 /trim_xxx -> 252:0"
 findmnt -o TARGET,SOURCE,FSTYPE | grep /vol     # /vol1  /dev/mapper/trim_xxx  btrfs
 ls /vol1                                       # 应出现 1000 / thumb / @timemachine
 ```
+
+刷完机后请留意：存储空间建好到界面变成「正常」之间，可能要等 1～2 分钟（定时器每 60 秒扫一次），期间界面会先显示「未挂载」，属正常。
 
 **Docker**
 
@@ -741,8 +795,8 @@ docker compose version                         # v2.x
 |---|---|
 | `fnnas-grow-rootfs.service` | 删掉根分区之后的 Android 遗留分区，把 `/` 扩到整块 eMMC 末尾并 `resize2fs` |
 | `fnnas-docker-heal.service` | 开机检查 5 个 Docker 文件，缺失就从 xz 备份恢复 |
-| `fnnas-vol-mount.service` + `.timer` | 按 FnNAS 约定把存储卷挂到 `/vol<id>`，开机 + 每 60 秒自愈 |
-| `fnnas-dockerd.sh` + `docker.service.d/10-fnnas-datadir.conf` | 把 Docker `data-root` 指向存储卷 |
+| `fnnas-vol-mount.service` + `.timer` | 按 FnNAS 约定把存储卷挂到 `/vol<id>`，并在根目录建 `<uuid>` 块设备别名节点；开机 + 每 60 秒自愈 |
+| `fnnas-dockerd.sh` + `docker.service.d/10-fnnas-datadir.conf` | 把 Docker `data-root` 指向存储卷（dockermgr 不会写 daemon.json），并在 dockermgr 因 `data-root=0` 而不启动 dockerd 时兜底拉起 |
 | `fnnas-unfix.sh` | 一键撤销全部兼容层与自愈（还原成原厂行为） |
 
 **日志位置**：`/var/log/fnnas-grow-rootfs.log`、`/var/log/fnnas-docker-heal.log`、`/var/log/fnnas-vol-mount.log`
@@ -753,9 +807,10 @@ docker compose version                         # v2.x
 .
 ├── hdmi_ubuntu26.04.1_update.img        # 正点原厂镜像（只读参照）
 ├── out/
-│   ├── fnnas_ATK-DLRK3568_FnNAS-v4_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
-│   │                                                  #   md5 c6cc45f0d97423255de3de76372d4ec4
-│   ├── fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img   # 缺设备别名，界面仍显示未挂载
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v5_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
+│   │                                                  #   md5 735d5d7d1461470f4ff58e8d5ead6047
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v4_2026.10.18.img   # Docker 自愈有依赖环死锁，docker 起不来
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img   # 无 Docker data-root 自愈
 │   ├── fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img   # ⚠️ 自愈脚本有 bug（每 60s 打挂 Web）
 │   ├── fnnas_ATK-DLRK3568_FnNAS-v1_2026.10.18.img   # 无存储卷自愈
 │   ├── MiniLoaderAll.bin                             # MASKROM 救砖用
@@ -785,6 +840,6 @@ docker compose version                         # v2.x
 按投入产出排序：
 
 1. **修串口接线** —— 串口是救砖时唯一的救命通道，值得花十分钟验证（TX/RX 短接做回环测试最快定位）
-2. **搭 ophub 重建流水线** —— 实现飞牛版本跟进，这是长期维护的关键
-3. **让 FnNAS 原生「去挂载」按钮可用** —— 目前靠 `fnnas-vol-mount.timer` 每 60 秒兜底。`stor_mount()` 内部对挂载点的具体校验分支还没追到底，值得继续逆 `storage.hdl`
+2. **拿一份 `/jsonrpc` 的真实响应** —— FnNAS 所有 `appcgi.*` 都走单一端点 `POST /jsonrpc`，但需要 `authx` 签名头（密钥硬编码在前端 `index-*.js` 里）。拿到响应就能彻底搞清楚 `stor_list` 是怎么算 `mountpoint` 的，本项目目前只验证了「卷已挂 + 根目录有 `<uuid>` 别名节点 → 界面正常」，中间机制没追清
+3. **搭 ophub 重建流水线** —— 实现飞牛版本跟进，这是长期维护的关键
 4. **串口 getty 与 FnNAS 系统日志打通** —— 目前只能靠 SSH 抓 `journalctl` 和 `/usr/trim/logs/`，有个串口会方便很多
