@@ -272,7 +272,7 @@ int get_sys_disk_free_space_partno() {
 }
 ```
 
-### 9. 我自己犯的八个错（全部有代价）
+### 9. 我自己犯的九个错（全部有代价）
 
 这一节记录的是**我自己在这次适配里犯的低级错误**，不是 FnNAS/正点原厂的问题。它们的共同点是：症状出现在很远的地方，根因在很近的地方。
 
@@ -329,6 +329,38 @@ if [ $# -eq 0 ]; then exit 0; fi
 服务跑完一次后停在 `active (exited)`，定时器再触发也不会重跑。现象极具迷惑性：`systemctl list-timers` 显示一切正常、`systemctl is-active` 也是 active，但功能就是不工作。
 
 > **硬性约定**：oneshot + timer 就**不要**加 `RemainAfterExit=yes`。
+
+**⑨ 自愈脚本里「无条件下游动作」直接把 Web 打挂了（这条最隐蔽）**
+
+`fnnas-vol-mount.sh` 结尾原本是：
+
+```bash
+if grep -qE '^/dev/(dm-|md|mapper)' /etc/mtab && pgrep -x trim; then
+    systemctl try-restart trim_main.service    # ← 无条件！
+    sleep 5
+fi
+```
+
+配上 60 秒的 timer，就变成**每分钟重启一次 FnNAS 后端**。症状极具误导性：
+
+- `ping` 通 ✔
+- 5666 / 5667 / 80 端口全开 ✔
+- `curl /` 返回 200 ✔（nginx 的静态文件根本不经过后端）
+- **但页面永远停在加载中**，因为所有 `/app/*` 接口都连不上 `trim_cgi.socket`
+
+最后是 sshd 也被拖垮（`connect to host ... port 22: Connection refused`），花了 90 秒才自己恢复。当时完全没想到是自己十分钟前刚启用的定时器干的。
+
+> **硬性约定**：自愈脚本里任何「影响其他服务的动作」（重启、改配置、刷新缓存）都必须**只在真正发生了状态变化时**才执行。同时给脚本加**快路径**：无事可做时立刻退出，连 `vgchange` / `udevadm settle` 都不碰。
+>
+> 修好后的形态：
+> ```bash
+> # 快路径：全部已挂载就直接退出，一个设备栈命令都不执行
+> if 全部已挂载; then echo "无需操作"; exit 0; fi
+> ...
+> # 只有本轮真的挂上了新卷，才通知 FnNAS 重建缓存
+> if [ "$MOUNTED" = "1" ]; then systemctl try-restart trim_main.service; fi
+> ```
+> 修好后：快路径耗时 0.435 秒，trim_main PID 90 秒内不变，Web 连续 6 次 200。
 
 ---
 
@@ -438,7 +470,38 @@ SELECT id,sync_speed_min,sync_speed_max,stripe_cache_size from mount WHERE uuid=
 
 > ⚠️ **oneshot + `RemainAfterExit=yes` 配 timer 是无效的**：服务跑一次后永久保持 `active (exited)`，定时器再也拉不动它。这个坑踩过一次，表现是「定时器明明 active 却从没触发」。
 
-验证：挂上 `/vol1` 后，FnNAS 立刻在卷上自动建出了用户目录 `/vol1/1000`、`/vol1/thumb`、`/vol1/@timemachine`，探针里也能看到 `realpath /vol1 -> /vol1` 被反复命中 —— 说明 FnNAS 侧已经完全认得这个卷。
+验证：挂上 `/vol1` 后，FnNAS 立刻在卷上自动建出了用户目录 `/vol1/1000`、`/vol1/thumb`、`/vol1/@timemachine`，`resmon_service.log` 里也从 `mountpt:`（空）变成了 `mountpt: /vol1`。
+
+**顺带把「Web 上显示未挂载」也解释清楚了。** 前端只有一行判定：
+
+```js
+if (!e.mountpoint) return { tagStatus: 'unmounted', tagType: 'orange', ... }
+```
+
+`mountpoint` 字段来自 `stor_list` → `get_vol_mount_point(uuid)` → `find_vol_mount_info()`，反汇编后是：
+
+```c
+mount_info_t* find_vol_mount_info(const char* uuid, mount_info_t* list, int n) {
+    uint64_t rdev = get_rdev(uuid);          // statx(AT_FDCWD, uuid, ...) 判断是否块设备
+    if (rdev != 0) {
+        for (...) if (entry->rdev == rdev) return entry;      // 正确路径：按 rdev 匹配
+        return NULL;
+    }
+    for (...) {
+        if (strcmp(entry->device, uuid) != 0) continue;        // 退化路径：直接比字符串
+        if (strncmp(entry->mountpoint, "/vol", 4) != 0) continue;
+        if ((entry->mountpoint[4] - '1') > 8) continue;        // 第 5 个字符必须是 '1'~'9'
+        return entry;
+    }
+    return NULL;
+}
+```
+
+而 `get_rdev()` 传进去的是**裸 uuid**（`trim_c31fedb1_...`），`trim` 进程的 CWD 是 `/`，`statx("trim_c31fedb1_...")` 必然 ENOENT → 返回 0 → **只能走退化路径**；退化路径拿 `/etc/mtab` 里的原始设备串 `/dev/mapper/trim_c31fedb1_...` 去 `strcmp` 裸 uuid，**多了 10 个字符的 `/dev/mapper/` 前缀，必然对不上**。
+
+所以只要 LVM 卷没被正确挂上，FnNAS 就一定认为它没挂载 —— 界面上的「未挂载」和「去挂载报 196616」是**同一个根因的两个症状**。
+
+（顺带确认了 `mountpoint[4]` 必须是 `'1'`~`'9'`：这解释了为什么系统卷是 `/vol00` 而用户卷从 `/vol1` 起算。）
 
 ### 整盘占用的实现
 
@@ -662,9 +725,10 @@ docker compose version                         # v2.x
 .
 ├── hdmi_ubuntu26.04.1_update.img        # 正点原厂镜像（只读参照）
 ├── out/
-│   ├── fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
-│   │                                                  #   md5 78386d6e9321b81dfa3108e190607fc0
-│   ├── fnnas_ATK-DLRK3568_FnNAS-v1_2026.10.18.img   # 上一版（无存储卷自愈）
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
+│   │                                                  #   md5 29d667b47e3af681508840d333905344
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img   # ⚠️ 自愈脚本有 bug，别用
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v1_2026.10.18.img   # 无存储卷自愈
 │   ├── MiniLoaderAll.bin                             # MASKROM 救砖用
 │   └── uboot.img                                     # 厂商 u-boot（参考）
 ├── kernel/

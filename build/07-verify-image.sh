@@ -1,6 +1,6 @@
 #!/bin/bash
 set +e
-IMG=/mnt/c/Users/Xuleyu/Documents/work/fn-atk/out/fnnas_ATK-DLRK3568_FnNAS-final_2026.10.16.img
+IMG=/mnt/c/Users/Xuleyu/Documents/work/fn-atk/out/fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img
 B=/root/atk-work/atk-build
 BOOT_OFF=$((0x4F9226))
 ROOT_OFF=$((0x5B8C226))
