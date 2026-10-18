@@ -1,6 +1,6 @@
 #!/bin/bash
 set +e
-IMG=/mnt/c/Users/Xuleyu/Documents/work/fn-atk/out/fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img
+IMG=/mnt/c/Users/Xuleyu/Documents/work/fn-atk/out/fnnas_ATK-DLRK3568_FnNAS-v4_2026.10.18.img
 B=/root/atk-work/atk-build
 BOOT_OFF=$((0x4F9226))
 ROOT_OFF=$((0x5B8C226))
@@ -84,6 +84,12 @@ echo "--- fstab ---"
 grep -vE '^\s*$|^\s*#' $W/mnt/etc/fstab 2>/dev/null | sed 's/^/    /'
 echo "--- umount shim 无参保护 ---"
 head -20 $W/mnt/usr/local/sbin/fnnas-compat/umount 2>/dev/null | grep -nE '\-eq 0|exit 0' | sed 's/^/    /'
+echo "--- 存储卷自愈脚本：设备别名 + 只在变更时重启 ---"
+grep -cE 'mknod "/\$UUID"' $W/mnt/usr/local/sbin/fnnas-vol-mount.sh | sed 's/^/    mknod 别名节点 出现次数: /'
+grep -cE 'RemainAfterExit' $W/mnt/etc/systemd/system/fnnas-vol-mount.service | sed 's/^/    RemainAfterExit(应为0): /'
+grep -nE 'try-restart trim_main' $W/mnt/usr/local/sbin/fnnas-vol-mount.sh | sed 's/^/    /'
+echo "--- docker 包装器 ---"
+grep -c 'data-root' $W/mnt/usr/local/sbin/fnnas-dockerd.sh | sed 's/^/    data-root 处理行数: /'
 
 echo
 echo "════ 5. ext4 特性 ════"

@@ -482,7 +482,8 @@ if (!e.mountpoint) return { tagStatus: 'unmounted', tagType: 'orange', ... }
 
 ```c
 mount_info_t* find_vol_mount_info(const char* uuid, mount_info_t* list, int n) {
-    uint64_t rdev = get_rdev(uuid);          // statx(AT_FDCWD, uuid, ...) 判断是否块设备
+    uint64_t rdev = get_rdev(uuid);          // 内部就是
+                                              // statx(AT_FDCWD, uuid, ...) 并判断是否块设备
     if (rdev != 0) {
         for (...) if (entry->rdev == rdev) return entry;      // 正确路径：按 rdev 匹配
         return NULL;
@@ -497,9 +498,36 @@ mount_info_t* find_vol_mount_info(const char* uuid, mount_info_t* list, int n) {
 }
 ```
 
-而 `get_rdev()` 传进去的是**裸 uuid**（`trim_c31fedb1_...`），`trim` 进程的 CWD 是 `/`，`statx("trim_c31fedb1_...")` 必然 ENOENT → 返回 0 → **只能走退化路径**；退化路径拿 `/etc/mtab` 里的原始设备串 `/dev/mapper/trim_c31fedb1_...` 去 `strcmp` 裸 uuid，**多了 10 个字符的 `/dev/mapper/` 前缀，必然对不上**。
+而 `entry->rdev` 在 `init_mount_cache()` 里是用 `statx(entry->device)`（也就是 `/etc/mtab` 的原始设备串 `/dev/dm-0`）填好的，这一步没问题。
 
-所以只要 LVM 卷没被正确挂上，FnNAS 就一定认为它没挂载 —— 界面上的「未挂载」和「去挂载报 196616」是**同一个根因的两个症状**。
+**问题出在 `get_rdev(uuid)` 这一侧**：传进去的是**裸 uuid**（`trim_c31fedb1_...-0`），`trim` 进程的 `WorkingDirectory` 是 `/`，`statx("trim_c31fedb1_...")` 必然 ENOENT → 返回 0 → **只能走退化路径**；退化路径拿 `/dev/dm-0` 去 `strcmp` 裸 uuid，**多了 10 个字符的 `/dev/mapper/` 前缀，必然对不上**。
+
+> 这段逻辑对 **ZFS 存储空间是成立的** —— ZFS 挂载后 `/etc/mtab` 的设备字段就是池名本身（`tank /vol1 zfs ...`），和 `mount.uuid` 完全相等。**LVM/RAID 路径则永远匹配不上。**
+
+**解法**：在根目录建一个名为 `<uuid>` 的块设备节点（与 LV 同 `major:minor`），`statx(uuid)` 就能成功，`find_vol_mount_info` 走 rdev 匹配，`mountpoint` 正确返回。
+
+```bash
+REAL=$(readlink -f /dev/mapper/$UUID)          # → /dev/dm-0
+MAJMIN=$(cat /sys/block/dm-0/dev)             # → 252:0（十进制）
+mknod "/$UUID" b "${MAJMIN%%:*}" "${MAJMIN##*:}"
+```
+
+这个节点由 `fnnas-vol-mount.sh` 自动维护（**必须在 `try-restart trim_main` 之前建好**，否则 trim 读到的是旧缓存），并在存储卷被删除后自动清理。
+
+验证方式不是靠猜 —— 我用 Python 精确复刻了 `get_rdev()` + `find_vol_mount_info()` 的语义直接跑：
+
+```
+建节点前：
+  get_rdev('trim_9096701c_...') = None
+  ✗ Path B: strcmp 没有匹配项（mtab 里是 '/dev/root'，uuid 是 'trim_9096701c_...'）
+  => get_vol_mount_point() 返回 None
+  => 前端判定：未挂载(unmounted)
+
+建节点后：
+  get_rdev('trim_9096701c_...') = (252, 0)
+  ✔ Path A 命中 rdev=(252, 0) -> /vol1
+  => 前端判定：已挂载
+```
 
 （顺带确认了 `mountpoint[4]` 必须是 `'1'`~`'9'`：这解释了为什么系统卷是 `/vol00` 而用户卷从 `/vol1` 起算。）
 
@@ -725,9 +753,10 @@ docker compose version                         # v2.x
 .
 ├── hdmi_ubuntu26.04.1_update.img        # 正点原厂镜像（只读参照）
 ├── out/
-│   ├── fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
-│   │                                                  #   md5 29d667b47e3af681508840d333905344
-│   ├── fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img   # ⚠️ 自愈脚本有 bug，别用
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v4_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
+│   │                                                  #   md5 c6cc45f0d97423255de3de76372d4ec4
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v3_2026.10.18.img   # 缺设备别名，界面仍显示未挂载
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img   # ⚠️ 自愈脚本有 bug（每 60s 打挂 Web）
 │   ├── fnnas_ATK-DLRK3568_FnNAS-v1_2026.10.18.img   # 无存储卷自愈
 │   ├── MiniLoaderAll.bin                             # MASKROM 救砖用
 │   └── uboot.img                                     # 厂商 u-boot（参考）
