@@ -31,11 +31,14 @@
 | 板载 WiFi（RTL8852BS / 8852bs） | ✅ 驱动正常 |
 | 板载蓝牙 | ✅ 固件保留 |
 | HDMI 输出（Panfrost GPU） | ✅ DTB 用正点原厂 `panfrost-hdmi` |
-| 系统盘容量 | ✅ **56.39 GB**（整块 eMMC 已并入根分区） |
-| device-mapper / LVM / mdadm | ✅ 内核已启用 |
-| **FnNAS 存储空间（创建卷）** | ⚠️ 外接 NVMe **已被正确识别**（`nvme0n1`），但**格式化步骤失败**，详见第六节 |
+| 系统盘容量 | ✅ **57.4 GB**（整块 eMMC 已并入根分区，开机自动扩容） |
+| device-mapper / LVM / mdadm / btrfs | ✅ 内核已启用（`CONFIG_BLK_DEV_DM` / `CONFIG_BLK_DEV_MD` 全家桶） |
+| **FnNAS 存储空间（创建 → 挂载 → 建共享）** | ✅ **M.2 NVMe 实测全流程通过**，详见第五节 |
+| **Docker 跑容器** | ✅ `hello-world` 实测通过，`data-root` 自动落在存储卷 |
 | **FnNAS 在线更新** | ❌ 架构不匹配，**切勿点击「立即更新」** |
 | 串口 console | ⚠️ 固件侧已配置正确，但需自行确认接线 |
+
+**一句话**：插一块 M.2 NVMe 进板子，刷上这个镜像，FnNAS 开箱即用 —— 建存储空间、挂载、建共享、跑容器全流程实测通过。
 
 ---
 
@@ -118,12 +121,31 @@ CONFIG_BLK_DEV_NVME / CONFIG_NVME_CORE / CONFIG_NVME
 CONFIG_SCSI_UFSHCD / CONFIG_UFS_FS
 CONFIG_PARTITION_ADVANCED
 
-# 2026-10-17 追加 —— 见第四节「存储空间」章节
+# 2026-10-17 追加 —— 见第五节「存储空间」章节
 CONFIG_BLK_DEV_DM=y
 CONFIG_DM_BUFIO / DM_BIO_PRISON / DM_SNAPSHOT / DM_THIN_PROVISIONING / DM_CRYPT
 CONFIG_BLK_DEV_MD=y
 CONFIG_MD_LINEAR / MD_RAID0 / MD_RAID1 / MD_RAID10
-```
+
+# 容器必需（cgroup v2 没有 device 控制器，Docker 起容器依赖 BPF）
+CONFIG_BPF_SYSCALL / CONFIG_BPF_JIT / CONFIG_BPF_JIT_DEFAULT_ON
+CONFIG_BPF_EVENTS / CONFIG_CGROUP_BPF
+
+# FnNAS 的网络栈（nftables + 配额 + 文件监控）
+CONFIG_NF_TABLES / NF_TABLES_IPV4 / NF_TABLES_IPV6
+CONFIG_NFT_NAT / NFT_MASQ / NFT_CT / NFT_COMPAT / NFT_HASH / NFT_LOG / NFT_LIMIT / NFT_QUOTA / NFT_REJECT
+CONFIG_IP_NF_NAT / IP_NF_IPTABLES / IP_NF_FILTER
+CONFIG_IP_NF_TARGET_MASQUERADE / IP_NF_TARGET_REDIRECT
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE / NETFILTER_XT_TARGET_REDIRECT
+CONFIG_NETFILTER_XT_MATCH_STATE / CONNTRACK / MULTIPORT / PHYSDEV
+CONFIG_BRIDGE_NETFILTER / CONFIG_VLAN_8021Q
+
+# 文件系统与配额
+CONFIG_BTRFS_FS / CONFIG_BTRFS_FS_DEVEL / CONFIG_BTRFS_FS_ZSTD / CONFIG_BTRFS_FS_XATTR
+CONFIG_OVERLAY_FS / CONFIG_TMPFS_XATTR
+CONFIG_FANOTIFY / CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+CONFIG_QUOTA / CONFIG_QUOTACTL
+CONFIG_CIFS / CONFIG_NFS_FS / CONFIG_NFSD / CONFIG_9P_FS / CONFIG_USB_STORAGE
 
 ### 网络与文件服务
 
@@ -250,6 +272,64 @@ int get_sys_disk_free_space_partno() {
 }
 ```
 
+### 9. 我自己犯的八个错（全部有代价）
+
+这一节记录的是**我自己在这次适配里犯的低级错误**，不是 FnNAS/正点原厂的问题。它们的共同点是：症状出现在很远的地方，根因在很近的地方。
+
+**① 改 `parameter.txt` 把 `rootfs` 改成 `-@0x00078000(rootfs)` → 刷完板子直接失联**
+
+`-` 语法在厂商文件里只用于 `userdata:grow`，RKDevTool 对 rootfs 这个位置不按同样方式建表。**改厂商分区描述符是高危操作**，本项目最终选择：一个字节都不动，分区手术放到开机脚本里做。
+
+**② `make olddefconfig` 忘了 `export ARCH=arm64` → `.config` 被重生成成 x86_64**
+
+```bash
+# 错：
+make olddefconfig
+# 对：
+export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+make olddefconfig
+```
+Rockchip SDK 的内核 Makefile 靠环境变量判断架构，漏了就会按宿主机的 x86_64 重新生成配置，编出来的东西能过编译但完全不是 ARM。
+
+**③ 构建脚本里路径写错 → 差点把上一版旧镜像当新版交付**
+
+`rm -f "$B/../out/..."` 里的相对路径基于 `$B` 而不是脚本位置，实际没删掉旧文件，后续步骤把旧镜像重新打包了一份。**教训：清理产物要用绝对路径，并在打包后强制比对时间戳和 md5。**
+
+**④ shim 脚本里构建期路径和运行时路径混用 → 兼容层静默失效**
+
+`install_compat` 里写 `$D$orig`（构建期的 rootfs 暂存目录）还是 `$orig`（运行时真实路径），两个概念混在一行里。结果是 shim 文件写到了错误位置，**软链指向空文件，脚本 exit 127 被 FnNAS 当成「命令失败」，表现成「加了兼容层但完全没变化」**。
+
+> **硬性约定**：`$D` 前缀只能出现在构建期路径，运行时路径一个都不能带。
+
+**⑤ shim 里用 `command -v umount` 兜底 → 无限 fork，板子进程耗尽**
+
+`/bin` 是 `/usr/bin` 的软链，`command -v umount` 在 PATH 里**先命中 shim 自己**，于是 shim 递归调用自己，进程表瞬间打满，板子彻底失去响应。
+
+> **硬性约定**：写 shim 时**参数空间必须整个覆盖**，不能用「找不到就 fallback 到同名命令」这种写法。
+
+**⑥ `umount` shim 没防无参调用 → util-linux 无参 umount 给全系统发 `SIGUSR1`**
+
+util-linux 的 `umount` 在**不传任何参数**时不是打印用法，而是**给除自己以外的所有进程发送 `SIGUSR1`**（提醒它们卸载了文件系统）。FnNAS 有一个周期性调用是无参的，于是所有服务被 `SIGUSR1` 打断、循环重启，表现为「Web 时通时断、进程数忽高忽低」。
+
+正确写法：
+
+```bash
+# 无参直接返回 0，什么都不做
+if [ $# -eq 0 ]; then exit 0; fi
+```
+
+**⑦（附带）`fuser -km /vol1` 把 FnNAS 服务全杀了**
+
+这条不是镜像问题，是我在实机验证时犯的。FnNAS 各服务的 cwd 都在 `/vol1` 下（用户 home、缩略图目录），`fuser -km` 一次性干掉了 PostgreSQL、imagesrv、mediasrv、rpc_broker 等几十个进程，SSH 也被踢掉。
+
+> **硬性约定**：在 FnNAS 上做「卸载后重挂」这类验证，**绝不能用 `fuser -km`**。先停掉依赖服务，或改用 `umount` + 单独杀持有者 PID 的方式。
+
+**⑧ systemd `oneshot` + `RemainAfterExit=yes` 配 timer 等于没有 timer**
+
+服务跑完一次后停在 `active (exited)`，定时器再触发也不会重跑。现象极具迷惑性：`systemctl list-timers` 显示一切正常、`systemctl is-active` 也是 active，但功能就是不工作。
+
+> **硬性约定**：oneshot + timer 就**不要**加 `RemainAfterExit=yes`。
+
 ---
 
 ## 五、已解决的问题
@@ -268,6 +348,97 @@ int get_sys_disk_free_space_partno() {
 | `dmsetup` 报 `open failed: No such device` | 内核无 device-mapper | 打开 `CONFIG_BLK_DEV_DM` |
 | mdadm / LVM 全部不可用 | 内核无 MD | 打开 `CONFIG_BLK_DEV_MD` + RAID0/1/10 |
 | eMMC 剩 41GB 无法使用 | 厂商 `parameter.txt` 把 `oem`+`userdata` 铺满 | 开机脚本删 p7/p8、p6 扩到盘尾、`resize2fs` 撑满 |
+| 创建存储空间报「暂无可用硬盘」 | 内核无 DM/MD，FnNAS 探测不到任何堆叠设备 | 打开 `CONFIG_BLK_DEV_DM` / `CONFIG_BLK_DEV_MD` 全家桶 |
+| 创建存储空间探测 ZFS 失败 | 原厂内核编了 out-of-tree ZFS，重编编不出来 | `zpool`/`zfs` 兼容层 shim |
+| `mdadm: --bitmap=lockless 不被支持` | mdadm 4.5 拒绝旧参数 | `mdadm` 兼容层 shim 剔除该参数 |
+| eMMC 健康检查不过，不让建存储空间 | `/dev/mmcblk0: Unable to detect device type, rc=1` | `smartctl` 兼容层 shim |
+| 点「去挂载」报 196616「挂载点已存在」 | 原厂 `triminitd` 开机自动挂载报 `unable to find record`，卷从未挂上 | 见下方「挂载点已存在」的完整拆解 |
+| Docker 起容器失败（cgroup v2 无 device 控制器） | 内核无 BPF | 打开 `CONFIG_BPF_SYSCALL` + `BPF_JIT` + `BPF_EVENTS` |
+| Docker 数据写在 eMMC 上 | `dockermgr` 不会把 `data-root` 写进 `daemon.json` | `fnnas-dockerd.sh` 包装器在 dockerd 启动前合并写入 |
+
+### 存储空间：七步故障链（每一步都有实机证据）
+
+在 RK3568 上让 FnNAS 真正创建出一个可挂载的存储空间，依次踩了七个坑：
+
+| # | 现象 | 根因 | 处理 |
+|---|---|---|---|
+| ① | `zpool status` 探测失败，存储空间建不出来 | 内核无 ZFS（out-of-tree，SDK 编不出） | `zpool`/`zfs` shim，无池时返回 `{"pools":{}}` rc=0 |
+| ② | `mdadm --create ... --bitmap=lockless` 被拒 | mdadm 4.5 移除该参数 | `mdadm` shim 剔除 `--bitmap=lockless` |
+| ③ | 提示「硬盘健康检查未通过」 | `smartctl` 认不出 eMMC：`Unable to detect device type, rc=1` | `smartctl` shim：eMMC 返回 `smart_support.available=false` + `smart_status.passed=true`，nvme/sd 原样透传 |
+| ④ | 挂载预清理阶段直接中止 | `umount` 在「本来没挂载」时返回非 0，被当致命错误 | `umount` shim 返回 0；**无参调用直接 exit 0**（见坑 11） |
+| ⑤ | 每次失败留下 `/vol00` 空壳，下次直接报「挂载点已存在」 | 失败回滚不干净 | 清理 `/vol00` |
+| ⑥ | Docker 起容器报 cgroup 相关错误 | 内核无 BPF，cgroup v2 没有 device 控制器 | `CONFIG_BPF_SYSCALL` |
+| ⑦ | 卷建出来了但永远「未挂载」 | 原厂 `triminitd` 自动挂载失败（见下） | `fnnas-vol-mount.service` 自愈 |
+
+成功后的实际设备栈：
+
+```
+nvme0n1 (931.5G, KIOXIA EXCERIA G2)
+└─ nvme0n1p1   linux_raid_member
+   └─ md127    raid1 (1/1)
+      └─ trim_c31fedb1_7213_4324_99e1_a1bebb46a145-0   btrfs  → /vol1
+```
+
+### 「挂载点已存在」的完整拆解
+
+这是最难的一个，报错码 `196616 = E_MOUNTPOINT_EXISTS`。
+
+**排查手段**：板子上没有 strace/gdb，于是自己编了一个 `LD_PRELOAD` 探针（`libfnnastrace.so`），hook `popen/system/stat/lstat/statx/fstatat/realpath/mkdir/open/openat/access/mount/umount2/setmntent/opendir`，只记录路径里含 `vol` / `trim_` / `dm-` / `nvme` 的调用。
+
+**第一手现场**：
+
+```
+[trim] [1]/dev/nvme0n1
+[trim] [2]/vol00/KIOXIA-EXCERIA G2 SSD
+[trim] popen_read2: WEXITSTATUS=12, mount ]]
+```
+
+—— FnNAS 在开机时执行的是 `mount /dev/nvme0n1 /vol00/...`，把**整块盘**往**可移动磁盘目录**里塞。
+
+**继续反查关键函数**（`storage.hdl` / `triminitd` / `libndev.so`）：
+
+- `storage.hdl` 是 `ELF 64-bit LSB shared object, ARM aarch64, not stripped`
+- `init_mount_cache()` 读的是 **`/etc/mtab`**（不是 `/proc/mounts`，本机 `/etc/mtab -> /proc/self/mounts`）
+- `find_mount_info_by_mount_point()` → `util::is_same_inode()` → `is_same_inode_by_realpath()`：先 `realpath()` 比字符串，任一路径不存在就返回 false
+- `req_mount_disk()` 收的字段是 **`disk`**（设备），op=2 → `removable_disk_mount()` —— 那是**可移动磁盘**通道，不是存储空间通道
+- 存储空间真正的入口是 **`req_remount_storage({uuid, comment})`** → op=23 → **`stor_mount(reqid, uuid, path, out)`**
+- `triminitd` 的开机自动挂载逻辑最清楚：
+
+```sql
+SELECT id,uuid,pool_type from mount WHERE id<>0 and id is NOT NULL
+UPDATE mount SET uuid=$1 WHERE uuid=$2
+SELECT id,sync_speed_min,sync_speed_max,stripe_cache_size from mount WHERE uuid=$1
+```
+
+**结论 —— FnNAS 的挂载点约定**：
+
+> 挂载点 = **`/vol` + `mount` 表的 `id`**；`id = 0` 是系统卷（对应目录 `/vol00`，也就是可移动磁盘的根），用户存储卷从 `id = 1` → `/vol1` 开始。
+> 设备 = `/dev/mapper/<mount.uuid>`（即 LVM LV 名）。
+
+本机 `id=1`，所以卷应该挂在 **`/vol1`**；而 `/vol1` 从来不存在。原厂 `triminitd::mount_storage()` 在这台板子上直接失败：
+
+```
+/usr/trim/logs/triminit.log:
+  [E] unable to find record for /dev/dm-0 uuid:trim_c31fedb1_7213_4324_99e1_a1bebb46a145-0
+```
+
+于是 Web 上点「去挂载」永远失败。
+
+**解法**：按 FnNAS 自己的约定补挂载，并做成开机 + 每 60 秒的自愈。
+
+```bash
+# /usr/local/sbin/fnnas-vol-mount.sh
+# 1) 等 PostgreSQL / LVM 就绪，必要时 mdadm --run 拉起 md
+# 2) SELECT id||'|'||uuid FROM mount WHERE id<>0     —— 拿不到就用上次成功的缓存
+# 3) 对每条记录：mkdir /vol<id>; mount /dev/mapper/<uuid> /vol<id>
+# 4) 挂上后 try-restart trim_main，让它重建挂载缓存（init_mount_cache 读 /etc/mtab）
+```
+
+配套 `fnnas-vol-mount.service` + `.timer`（`OnBootSec=120s`、`OnUnitActiveSec=60s`）。
+
+> ⚠️ **oneshot + `RemainAfterExit=yes` 配 timer 是无效的**：服务跑一次后永久保持 `active (exited)`，定时器再也拉不动它。这个坑踩过一次，表现是「定时器明明 active 却从没触发」。
+
+验证：挂上 `/vol1` 后，FnNAS 立刻在卷上自动建出了用户目录 `/vol1/1000`、`/vol1/thumb`、`/vol1/@timemachine`，探针里也能看到 `realpath /vol1 -> /vol1` 被反复命中 —— 说明 FnNAS 侧已经完全认得这个卷。
 
 ### 整盘占用的实现
 
@@ -296,56 +467,15 @@ int get_sys_disk_free_space_partno() {
 
 ---
 
-## 六、没有解决的问题（重要）
+## 六、遗留问题与边界
 
-### 1. FnNAS 存储空间：外接盘已被识别，但格式化失败 🔴
+### 1. 存储空间只能建在真实块设备上（已绕开）🟡
 
-这是投入最大的问题，**2026-10-17 晚有了决定性进展**。
+`is_dev_disk()` 的白名单只有 `sd`/`nvme`/`hd`/`vd`/`mmc` 五个前缀（见第四节坑 8）。所以**在 eMMC 上凭空造不出「独立硬盘」** —— dm-linear、loop 伪装都不行，根因是 **dm 设备和 loop 设备都没有 `/sys/block/<dev>/device/` 目录**，而 `mmcblk0` / `mmcblk0boot0` 有。
 
-#### 已经验证成立的部分 ✅
+**现状**：M.2 槽的 NVMe SSD（`nvme0n1`）前缀命中白名单，FnNAS 能正常识别为硬盘，创建存储空间 → 挂载 → 建共享 → 跑容器**全部实测通过**。eMMC 只作系统盘，整块 64GB 通过开机扩容脚本占满。
 
-插上一块 **KIOXIA EXCERIA G2 931.51GB NVMe SSD** 后，FnNAS **正确识别并列出**了它：
-
-```
-931.51 GB   未使用
-硬盘类型    SSD          型号  KIOXIA-EXCERIA G2 SSD
-接口协议    NVMe         序列号 52VFC00TFM15
-分区        nvme0n1p1    健康状态 正常 / 41°C
-```
-
-**这直接验证了第四节的逆向结论** —— `is_dev_disk()` 的五前缀白名单是对的，带 `device/` 的真实块设备确实会被 FnNAS 当作独立硬盘。对比之下，eMMC 上的分区（无论怎么摆）都进不了这个列表。
-
-#### 仍未解决的部分 ❌
-
-**FnNAS 在最后的「确认格式化」步骤反复失败**，存储空间建不出来。
-
-从 `storage.hdl` 的字符串看，它建卷时固定执行：
-
-```bash
-parted --script /dev/nvme0n1 mklabel gpt
-parted --script /dev/nvme0n1 mkpart primary 1MiB 100% set 1 raid on   # 或 msftdata
-mke2fs -O project,quota,bigalloc -F -m bigalloc /dev/nvme0n1p1
-```
-
-**两个最可能的原因**（尚未拿到实际 stderr，无法确定）：
-
-1. **`-O project,quota,bigalloc` 这组选项** —— `bigalloc` 会把块大小设得很大（默认 16K 甚至更大），若与分区对齐、`mke2fs` 版本不匹配就会失败；project quota 还需要内核侧 `CONFIG_QUOTA` / quota 相关支持
-2. **NVMe 链路稳定性** —— 41°C 说明盘在发热，若控制器超时或掉线，格式化中途失败也符合
-
-#### 需要做的排查
-
-```bash
-# 拿到 FnNAS 实际调用的 parted / mkfs stderr
-sudo grep -rE 'parted|mke2fs|mkfs|Format|format' /usr/trim/logs/*.log | tail -40
-
-# 手动复现格式化，看真实报错（⚠️ 会清空整块盘）
-sudo parted -s /dev/nvme0n1 mklabel gpt
-sudo parted -s /dev/nvme0n1 mkpart primary 1MiB 100%
-sudo mkfs.ext4 -O project,quota,bigalloc -F -m bigalloc /dev/nvme0n1p1
-```
-
-> 如果 `-O project,quota,bigalloc` 报错，去掉这三个选项试试 `mke2fs -t ext4 -F /dev/nvme0n1p1`。
-> 如果 parted 报错，先确认盘没被挂载：`lsblk -no MOUNTPOINT /dev/nvme0n1`。
+**如果板子上没有 NVMe**：插一块 USB 移动硬盘 / U 盘 / USB-SATA 盒子里的 SSD，同样可用。
 
 ### 2. 在线更新不可用 🔴
 
@@ -372,18 +502,23 @@ linux-image-6.18.18.c1145-trim   34.26M
 
 板载 UART 是 **UART2**：`GPIO0_D0 = RX`、`GPIO0_D1 = TX`（pinctrl `uart2m0_xfer`），CH340 在板上以 3.3V TTL 连出。
 
-### 4. 硬件扩展 ⚠️
+### 4. 硬件扩展限制 ⚠️
 
-- **M.2 NVMe 可用 ✅** —— 实测插入 NVMe SSD 后被识别为 `nvme0n1`（931.51GB，SMART 健康），内核 `pcie-rkep` + `nvme` 驱动正常工作
-
-  > ⚠️ 早期文档曾写「本板没有 PCIe、M.2 不可用」，**这是错的**。当时探测 `/sys/bus/pci/devices/` 为空，是因为**没有任何 PCIe 设备接入**，控制器驱动自然不会加载。插盘后即恢复。
-
-- **USB 3.0 主机口 × 2**（5Gbps xHCI + DWC3）—— 备选的外接存储途径
+- **没有 PCIe**：`/sys/bus/pci/devices/` 为空，`pcie-rkep` 未加载 → **M.2 NVMe 不可用**
+- **USB 3.0 主机口 × 2**（5Gbps xHCI + DWC3）→ 这是唯一可行的外接存储途径
 - 运行内存仅 4GB
 
-### 5. Docker 默认仍写系统盘 ⚠️
+### 5. Docker 数据目录自动跟随存储卷 ✅
 
-没有存储空间时 `/var/lib/docker` 仍在 56GB 系统盘里。容量够用但不理想，**存储空间建成后建议手动切过去**。
+`dockermgr` 每次启动都会按 `dockermgr.conf` 重写 `/etc/docker/daemon.json`，但**它不会把 `data-root` 写进去** —— 在 `dockermgr.conf` 里填了也不生效。
+
+因此加了启动包装器 `/usr/local/sbin/fnnas-dockerd.sh`（通过 `docker.service.d/10-fnnas-datadir.conf` 接管 `ExecStart`）：启动前检测有没有挂载在 `/volN` 的**独立文件系统**，有就把 `data-root` 合并写进 `daemon.json`（保留 dockermgr 写的其他键），并同步回 `dockermgr.conf` 让 Web 界面显示正确。
+
+> ⚠️ 两个坑：
+> ① dockerd **不允许** `data-root` 同时出现在命令行和 `daemon.json`，会直接退出 1（`the following directives are specified both as a flag and in the configuration file`）。所以只能改配置文件，不能加命令行参数。
+> ② `dockermgr` 会覆盖 `daemon.json`，所以包装器必须在**每次** dockerd 启动前重写，不能只在构建时写一次。
+
+没有存储卷时自动回落到 `/var/lib/docker`，行为与原来一致。
 
 ### 6. `fnnas-tf` 行为变化 ⚠️
 
@@ -435,7 +570,11 @@ mkimage -f boot-gz.its -E -p 0x800 boot-gz.img
       ↓
 修 fstab / 串口 getty / mask resize-rootfs
       ↓
-安装 fnnas-grow-rootfs.service
+安装 fnnas-grow-rootfs.service（整块 eMMC 并入 /）
+      ↓
+安装 5 层 FnNAS 兼容层 + fnnas-docker-heal.service
+      ↓
+安装 fnnas-vol-mount.{service,timer} + fnnas-dockerd.sh
       ↓
 make modules_install（160 个模块，与内核同批）
       ↓
@@ -464,35 +603,78 @@ e2fsck -f -D
 
 1. **关闭并重新打开 RKDevTool**（必须，否则会用缓存里的旧镜像）
 2. **拔掉 TF/SD 卡**（SPL 优先枚举 MMC2，插着会抢启动顺序）
-3. 「升级固件」页 → 选择 `fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img` → 升级
+3. 「升级固件」页 → 选择 `fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img` → 升级
 4. **断电重新上电**（不能只看 RKDevTool 提示）
 5. 网线插 **`end1`**（不是 `end0`）
 6. 浏览器访问 `http://<板子IP>:5666`
 
+> ⚠️ 板子上 `/home/<user>/.ssh/` 在每次刷机后都会被冲掉，需要重新安装公钥或改用串口。
+
 ### 首次验证
 
+**基础**
+
 ```bash
-df -h /                                   # 应显示 ~56G
-cat /var/log/fnnas-grow-rootfs.log        # 应看到 删p7/删p8/扩到100%/resize2fs完成
-systemctl is-active fnnas-grow-rootfs    # active
+df -h /                                   # 应显示 ~57G
+cat /var/log/fnnas-grow-rootfs.log        # 应看到 删p7/删p8/扩到100%/resize2fs 完成
+systemctl is-active fnnas-grow-rootfs     # active
 lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT /dev/mmcblk0   # 应只剩 p1~p6
+systemctl is-active fnnas-docker-heal     # active
+```
+
+**存储空间（插了 M.2 NVMe 的情况下）**
+
+Web → 存储空间 → 创建存储空间 → 选 NVMe → Basic / RAID1 → 确认。
+建完之后**不需要**做任何手工操作：
+
+```bash
+systemctl is-active fnnas-vol-mount.timer       # active
+tail -20 /var/log/fnnas-vol-mount.log          # 应看到 "挂载成功 -> /vol1 (btrfs)"
+findmnt -o TARGET,SOURCE,FSTYPE | grep /vol     # /vol1  /dev/mapper/trim_xxx  btrfs
+ls /vol1                                       # 应出现 1000 / thumb / @timemachine
+```
+
+**Docker**
+
+```bash
+docker info | grep 'Docker Root Dir'           # 应为 /vol1/docker
+docker run --rm hello-world                    # 应打印 Hello from Docker!
+docker compose version                         # v2.x
 ```
 
 ---
 
-## 十、目录结构
+## 十、镜像内新增的 systemd 组件
+
+| 组件 | 作用 |
+|---|---|
+| `fnnas-grow-rootfs.service` | 删掉根分区之后的 Android 遗留分区，把 `/` 扩到整块 eMMC 末尾并 `resize2fs` |
+| `fnnas-docker-heal.service` | 开机检查 5 个 Docker 文件，缺失就从 xz 备份恢复 |
+| `fnnas-vol-mount.service` + `.timer` | 按 FnNAS 约定把存储卷挂到 `/vol<id>`，开机 + 每 60 秒自愈 |
+| `fnnas-dockerd.sh` + `docker.service.d/10-fnnas-datadir.conf` | 把 Docker `data-root` 指向存储卷 |
+| `fnnas-unfix.sh` | 一键撤销全部兼容层与自愈（还原成原厂行为） |
+
+**日志位置**：`/var/log/fnnas-grow-rootfs.log`、`/var/log/fnnas-docker-heal.log`、`/var/log/fnnas-vol-mount.log`
+
+### 本仓库目录结构
 
 ```
 .
 ├── hdmi_ubuntu26.04.1_update.img        # 正点原厂镜像（只读参照）
 ├── out/
-│   ├── fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img   # ★ 成品
-│   ├── MiniLoaderAll.bin                # MASKROM 救砖用
-│   └── uboot.img                        # 厂商 u-boot（参考）
-└── tools/                               # 构建与诊断脚本
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v2_2026.10.18.img   # ★ 成品（3,694,707,274 字节）
+│   │                                                  #   md5 78386d6e9321b81dfa3108e190607fc0
+│   ├── fnnas_ATK-DLRK3568_FnNAS-v1_2026.10.18.img   # 上一版（无存储卷自愈）
+│   ├── MiniLoaderAll.bin                             # MASKROM 救砖用
+│   └── uboot.img                                     # 厂商 u-boot（参考）
+├── kernel/
+│   └── fnnas.config                     # 内核配置片段（129 行 CONFIG）
+└── build/                               # 构建与诊断脚本
+    ├── 87-rebuild-rootfs-final.sh        # rootfs 构建主脚本
+    ├── 89-diag-shell-image.sh           # 原位替换打包
+    ├── 90-verify-final-image.sh         # 分段校验
+    └── 95-build-all-dm-md.sh            # 一键全流程
 ```
-
-> `out/` 目录里还留着开发过程中的历史镜像，可自行删除。
 
 ---
 
@@ -509,88 +691,7 @@ lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT /dev/mmcblk0   # 应只剩 p1~p6
 
 按投入产出排序：
 
-1. **插一块 USB 硬盘** —— 最快解决存储空间问题，FnNAS 会直接识别 `/dev/sda`
-2. **修串口接线** —— 串口是救砖时唯一的救命通道，值得花十分钟验证
-3. **搭 ophub 重建流水线** —— 实现飞牛版本跟进，这是长期维护的关键
-4. **继续逆向 `listFreeDisk`** —— 需要更深入地追 `list_block_device()` 里的 JSON 组装逻辑。strace + gdb + 符号表 + 反汇编的工具链已经就位（见 `tools/` 目录下的 `dis*.sh`、`pull-bin.sh`），但最终那道判断分支至今没有命中过
-
----
-
-## 十三、镜像下载
-
-### 当前状态：Release 暂未附镜像
-
-本镜像 3.5 GB。GitHub Release 单附件上限是 **2 GB**，需要拆成两卷上传；
-但实测当前网络上行仅约 **0.15 MB/s**，传完需要近 10 小时，因此**暂未附带二进制**。
-
-如果你需要现成的镜像，可以：
-
-1. **自行构建**（推荐，见下）
-2. 在 **Releases** 页面提 Issue 索要，作者可按需上传
-3. 自行传（若有较快网络）：
-   ```bash
-   # 先切分
-   split -b 1847353637 -d -a 1 fnnas.img fnnas.img.part
-   # 再上传
-   gh release upload v1.0.0701-2026-10-17 fnnas.img.part0 fnnas.img.part1
-   ```
-
-### 镜像信息（供自行构建后比对）
-
-| 项 | 值 |
-|---|---|
-| 文件名 | `fnnas_ATK-DLRK3568_FnNAS-grow_2026.10.17.img` |
-| 大小 | 3,694,707,274 字节 |
-| MD5 | `105bbbe34c62288413f28c2f00c04bbd` |
-| 格式 | RKAF（头 4 字节 `524b4657` = "RKFW"） |
-| 构建时间 | 2026-10-17 19:12 |
-
-### 自行构建
-
-本镜像是**完全可复现**的 —— 所有构建脚本都在 `build/` 目录：
-
-```bash
-bash build/00-build-all.sh
-```
-
-详见第七节与第九节。
-
-> ⚠️ 构建需要正点原子官方 SDK 和一份原厂 `hdmi_ubuntu26.04.1_update.img`（含 FnNAS ARM 用户空间）。
-> 该原厂镜像受正点原子版权保护，**不随本仓库分发**，请自行从正点原子渠道获取。
-
----
-
-## 十四、仓库结构
-
-```
-.
-├── README.md                    ← 本文档
-├── LICENSE
-├── .gitignore
-├── docs/
-│   └── porting-notes.md         ← 踩坑记录（见第四节）
-├── kernel/
-│   ├── fnnas.config             ← FnNAS 必需的内核配置片段
-│   ├── dm-md-fragment.config    ← device-mapper / MD 片段
-│   └── dm-md-only.config        ← 仅 DM/MD 部分（增量合并用）
-├── build/                       ← 可复现构建流水线
-│   ├── 00-build-all.sh          ← 一键构建
-│   ├── 01-apply-kernel-config.sh
-│   ├── 02-build-kernel.sh
-│   ├── 03-build-dtb.sh
-│   ├── 04-extract-resource.sh
-│   ├── 05-build-rootfs.sh
-│   ├── 06-pack-image.sh
-│   └── 07-verify-image.sh
-├── research/                    ← FnNAS 存储子系统逆向（非构建必需）
-│   ├── README.md                ← 逆向结论与工具用法
-│   └── *.sh
-└── tools-serial/                ← 串口记录/诊断脚本（Windows）
-```
-
-## License
-
-本仓库的**脚本与文档**以 [GPL-2.0](LICENSE) 发布（与 Linux 内核配置片段的许可保持一致）。
-
-镜像中包含的正点原子原厂二进制（u-boot、DTB、resource.img、FnNAS 用户空间）
-**版权归各自所有者所有**，本仓库仅作技术研究用途分发其二进制产物。
+1. **修串口接线** —— 串口是救砖时唯一的救命通道，值得花十分钟验证（TX/RX 短接做回环测试最快定位）
+2. **搭 ophub 重建流水线** —— 实现飞牛版本跟进，这是长期维护的关键
+3. **让 FnNAS 原生「去挂载」按钮可用** —— 目前靠 `fnnas-vol-mount.timer` 每 60 秒兜底。`stor_mount()` 内部对挂载点的具体校验分支还没追到底，值得继续逆 `storage.hdl`
+4. **串口 getty 与 FnNAS 系统日志打通** —— 目前只能靠 SSH 抓 `journalctl` 和 `/usr/trim/logs/`，有个串口会方便很多
